@@ -2732,65 +2732,6 @@ if (import.meta.main) {
           break;
         }
 
-        default:
-          console.error("Usage: qmd server <start|stop|status>");
-          console.error("");
-          console.error("Commands:");
-          console.error("  start   Start the QMD socket server");
-          console.error("  stop    Stop the running server");
-          console.error("  status  Check server status");
-          process.exit(1);
-      }
-      break;
-    }
-
-    case "server": {
-      const subcommand = cli.args[0];
-      const { isServerRunning, getServerPid, stopServer, startServer } = await import("./server.js");
-
-      switch (subcommand) {
-        case "start": {
-          if (isServerRunning()) {
-            const pid = getServerPid();
-            console.log(`${c.yellow}Server is already running (PID: ${pid})${c.reset}`);
-            console.log(`Socket: ~/.cache/qmd/app.sock`);
-            process.exit(0);
-          }
-          console.log(`${c.bold}Starting QMD Server...${c.reset}`);
-          startServer();
-          // startServer() doesn't return, it runs indefinitely
-          break;
-        }
-
-        case "stop": {
-          if (!isServerRunning()) {
-            console.log(`${c.dim}Server is not running${c.reset}`);
-            process.exit(0);
-          }
-          const pid = getServerPid();
-          console.log(`Stopping server (PID: ${pid})...`);
-          if (stopServer()) {
-            console.log(`${c.green}✓ Server stopped${c.reset}`);
-          } else {
-            console.error(`${c.yellow}Failed to stop server gracefully${c.reset}`);
-            process.exit(1);
-          }
-          break;
-        }
-
-        case "status": {
-          if (isServerRunning()) {
-            const pid = getServerPid();
-            console.log(`${c.green}● Server is running${c.reset}`);
-            console.log(`  PID: ${pid}`);
-            console.log(`  Socket: ~/.cache/qmd/app.sock`);
-          } else {
-            console.log(`${c.dim}○ Server is not running${c.reset}`);
-            console.log(`  Socket: ~/.cache/qmd/app.sock`);
-          }
-          break;
-        }
-
         case "daemon": {
           const daemonSubcommand = cli.args[1];
           const {

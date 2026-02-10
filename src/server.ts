@@ -15,7 +15,8 @@
  */
 
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, unlinkSync, readFileSync } from "fs";
+import { Glob } from "bun";
+import { existsSync, mkdirSync, unlinkSync, readFileSync, statSync } from "fs";
 import { join } from "path";
 import type { Socket } from "bun";
 import {
@@ -29,11 +30,18 @@ import {
   getDocumentBody,
   listCollections,
   hashContent,
+  extractTitle,
+  handelize,
   insertContent,
   insertDocument,
   findActiveDocument,
   updateDocument,
   updateDocumentTitle,
+  deactivateDocument,
+  getActiveDocumentPaths,
+  cleanupOrphanedContent,
+  clearCache,
+  getHashesNeedingEmbedding,
   DEFAULT_EMBED_MODEL,
   DEFAULT_QUERY_MODEL,
   DEFAULT_RERANK_MODEL,
@@ -45,6 +53,7 @@ import {
   type GenerateResult,
 } from "./llm.js";
 import type { RankedResult, SearchResult } from "./store.js";
+import { addCollection as addCollectionToConfig, getCollection as getCollectionFromConfig } from "./collections.js";
 
 // =============================================================================
 // Configuration
@@ -146,6 +155,12 @@ type StatusResult = {
   collections: number;
   documents: number;
   hasVectorIndex: boolean;
+};
+
+type CreateCollectionRequest = {
+  name: string;
+  path: string;
+  pattern?: string;
 };
 
 // =============================================================================
@@ -506,6 +521,148 @@ Answer:`;
     };
   }
 
+  handleCollectionCreate(params: CreateCollectionRequest): CollectionInfo {
+    const name = params.name.trim();
+    const path = params.path.trim();
+    const pattern = (params.pattern || "**/*.md").trim() || "**/*.md";
+
+    if (!name) {
+      throw new Error("Collection name is required");
+    }
+    if (!path) {
+      throw new Error("Collection path is required");
+    }
+    if (!existsSync(path)) {
+      throw new Error(`Collection path does not exist: ${path}`);
+    }
+    if (!statSync(path).isDirectory()) {
+      throw new Error(`Collection path is not a directory: ${path}`);
+    }
+
+    const existing = getCollectionFromConfig(name);
+    if (existing) {
+      throw new Error(`Collection already exists: ${name}`);
+    }
+
+    addCollectionToConfig(name, path, pattern);
+    this.startCollectionIndexing(name, path, pattern);
+
+    return {
+      name,
+      path,
+      pattern,
+      documents: 0,
+      lastModified: null,
+    };
+  }
+
+  private startCollectionIndexing(collectionName: string, path: string, pattern: string): void {
+    void this.indexCollection(collectionName, path, pattern).catch((error) => {
+      console.error(`Failed to index collection '${collectionName}':`, error);
+    });
+  }
+
+  private async indexCollection(
+    collectionName: string,
+    collectionPath: string,
+    pattern: string
+  ): Promise<void> {
+    const now = new Date().toISOString();
+    const excludeDirs = new Set(["node_modules", ".git", ".cache", "vendor", "dist", "build"]);
+
+    clearCache(this.store.db);
+
+    const glob = new Glob(pattern);
+    const files: string[] = [];
+    for await (const file of glob.scan({ cwd: collectionPath, onlyFiles: true, followSymlinks: true })) {
+      const parts = file.split("/");
+      const shouldSkip = parts.some((part) =>
+        part === "node_modules" || part.startsWith(".") || excludeDirs.has(part)
+      );
+      if (!shouldSkip) {
+        files.push(file);
+      }
+    }
+
+    if (files.length === 0) {
+      console.log(`Collection '${collectionName}' has no files matching ${pattern}`);
+      return;
+    }
+
+    let indexed = 0;
+    let updated = 0;
+    let unchanged = 0;
+    const seenPaths = new Set<string>();
+
+    for (const relativeFile of files) {
+      const fullPath = join(collectionPath, relativeFile);
+      const content = readFileSync(fullPath, "utf-8");
+      if (!content.trim()) {
+        continue;
+      }
+
+      const path = handelize(relativeFile);
+      seenPaths.add(path);
+      const hash = await hashContent(content);
+      const title = extractTitle(content, relativeFile);
+      const existing = findActiveDocument(this.store.db, collectionName, path);
+      const stat = statSync(fullPath);
+
+      if (existing) {
+        if (existing.hash === hash) {
+          if (existing.title !== title) {
+            updateDocumentTitle(this.store.db, existing.id, title, now);
+            updated++;
+          } else {
+            unchanged++;
+          }
+          continue;
+        }
+
+        insertContent(this.store.db, hash, content, now);
+        updateDocument(
+          this.store.db,
+          existing.id,
+          title,
+          hash,
+          new Date(stat.mtime).toISOString()
+        );
+        updated++;
+        continue;
+      }
+
+      insertContent(this.store.db, hash, content, now);
+      insertDocument(
+        this.store.db,
+        collectionName,
+        path,
+        title,
+        hash,
+        new Date(stat.birthtime).toISOString(),
+        new Date(stat.mtime).toISOString()
+      );
+      indexed++;
+    }
+
+    let removed = 0;
+    const activePaths = getActiveDocumentPaths(this.store.db, collectionName);
+    for (const path of activePaths) {
+      if (!seenPaths.has(path)) {
+        deactivateDocument(this.store.db, collectionName, path);
+        removed++;
+      }
+    }
+
+    cleanupOrphanedContent(this.store.db);
+    const needsEmbedding = getHashesNeedingEmbedding(this.store.db);
+    console.log(
+      `Collection '${collectionName}' indexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed.`
+    );
+    if (needsEmbedding > 0) {
+      console.log(`Embedding refresh needed: ${needsEmbedding} content hashes.`);
+    }
+  }
+
   // =============================================================================
   // Server Lifecycle
   // =============================================================================
@@ -633,6 +790,10 @@ Answer:`;
 
         case "status":
           result = this.handleStatus();
+          break;
+
+        case "collection_create":
+          result = this.handleCollectionCreate(params as CreateCollectionRequest);
           break;
 
         default:
